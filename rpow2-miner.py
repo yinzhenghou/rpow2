@@ -6,20 +6,43 @@ Get cookie: F12→Network→right-click api.rpow2.com request→Copy as cURL→g
 import argparse, ctypes, json, os, re, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Native C SHA-256 (optional, ~15x speedup)
+# ===================== Backend Detection =====================
+# Priority: GPU (CUDA) > CPU (C native) > Python fallback
+GPU = False
+NATIVE = False
+
+# Try GPU library first (libgpu_miner.so, CUDA)
 try:
-    _lib = ctypes.CDLL(os.path.join(os.path.dirname(__file__), "libminer.so"))
-    _lib.mine_worker.argtypes = [
+    _gpu_lib = ctypes.CDLL(os.path.join(os.path.dirname(__file__), "libgpu_miner.so"))
+    _gpu_lib.gpu_init.restype = ctypes.c_int
+    _gpu_lib.gpu_name.restype = ctypes.c_char_p
+    _gpu_lib.gpu_mine_batch.argtypes = [
         ctypes.c_void_p, ctypes.c_size_t,
         ctypes.c_int,
-        ctypes.c_uint64, ctypes.c_uint64,
-        ctypes.c_void_p,
-        ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
     ]
-    NATIVE = True
+    _gpu_lib.gpu_mine_batch.restype = ctypes.c_int
+    if _gpu_lib.gpu_init():
+        GPU = True
 except Exception:
-    NATIVE = False
-    import hashlib
+    pass
+
+# Fallback to CPU native C
+if not GPU:
+    try:
+        _lib = ctypes.CDLL(os.path.join(os.path.dirname(__file__), "libminer.so"))
+        _lib.mine_worker.argtypes = [
+            ctypes.c_void_p, ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_uint64, ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+        ]
+        NATIVE = True
+    except Exception:
+        NATIVE = False
 
 try:
     from curl_cffi import requests
@@ -68,6 +91,13 @@ class Miner:
             self.sess.cookies.set(k, v, domain="rpow2.com")
 
         self.threads = threads or os.cpu_count() or max(1, threading.active_count())
+        if GPU:
+            gpu_name = _gpu_lib.gpu_name().decode()
+            print(f"  Backend: GPU [{gpu_name}]")
+        elif NATIVE:
+            print(f"  Backend: CPU native C ({self.threads} cores)")
+        else:
+            print(f"  Backend: Python hashlib ({self.threads} threads, SLOW)")
         self._stop = threading.Event()
         self._found = None
         self._flock = threading.Lock()
@@ -97,6 +127,44 @@ class Miner:
     def me(self): return self._api("GET", "/me")
     def challenge(self): return self._api("POST", "/challenge")
     def mint(self, cid, nonce): return self._api("POST", "/mint", {"challenge_id": cid, "solution_nonce": nonce})
+
+    def _worker_gpu(self, prefix_bytes, diff):
+        """GPU-backed mining worker — calls gpu_mine_batch in a loop."""
+        base = ctypes.c_uint64(0)
+        count = ctypes.c_uint64(0)
+        found = ctypes.c_uint64(0xFFFFFFFFFFFFFFFF)
+        prefix_arr = (ctypes.c_uint8 * len(prefix_bytes))(*prefix_bytes)
+
+        t0 = time.time()
+        last_report = t0
+        while not self._stop.is_set():
+            ret = _gpu_lib.gpu_mine_batch(
+                prefix_arr, len(prefix_bytes), diff,
+                ctypes.byref(base), ctypes.byref(count),
+                ctypes.byref(found)
+            )
+            if ret == 1 or found.value != 0xFFFFFFFFFFFFFFFF:
+                self._hcount = count.value
+                elapsed = time.time() - t0
+                total = count.value
+                print(f"\n  Found! nonce={found.value} ({total/1e6:.1f}M hashes, {total/elapsed/1e6:.2f} MH/s, {elapsed:.1f}s)")
+                return str(found.value)
+            if ret < 0:
+                raise RuntimeError(f"GPU error code={ret}")
+
+            # Report progress
+            now = time.time()
+            if now - last_report >= 2.0:
+                e = now - t0
+                cv = count.value
+                print(f"    {cv/1e6:.1f}M hashes, {cv/e/1e6:.2f} MH/s", end="\r")
+                last_report = now
+
+            if self._stop.is_set():
+                break
+
+        self._hcount = count.value
+        raise RuntimeError("Mining interrupted, no solution")
 
     def _worker(self, tid, prefix, diff, start, step):
         if NATIVE:
@@ -151,6 +219,9 @@ class Miner:
 
     def _mine(self, phex, diff):
         prefix = bytes.fromhex(phex)
+        if GPU:
+            print(f"  Mining... prefix={phex[:24]}... diff={diff} [GPU]")
+            return self._worker_gpu(prefix, diff)
         n = max(1, self.threads or os.cpu_count())
         self._stop.clear()
         self._found = None
@@ -181,8 +252,9 @@ class Miner:
         return str(self._found)
 
     def run(self):
+        tag = "GPU" if GPU else ("NATIVE C" if NATIVE else "PYTHON")
         print("=" * 60)
-        print(f" rpow2.com VPS Miner [NATIVE C] ({'curl_cffi' if CURL_CFFI else 'requests'})")
+        print(f" rpow2.com VPS Miner [{tag}] ({'curl_cffi' if CURL_CFFI else 'requests'})")
         print("=" * 60)
         try:
             u = self.me()
